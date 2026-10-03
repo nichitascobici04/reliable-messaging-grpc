@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="BrokerApp/BrokerApp.csproj" />
+  <Project Path="Contracts/Contracts.csproj" />
+</Solution>

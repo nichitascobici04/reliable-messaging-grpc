@@ -1,0 +1,194 @@
+﻿syntax = "proto3";
+
+package reliablemessaging.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option csharp_namespace = "ReliableMessaging.Contracts.V1";
+
+// =====================================================================
+// CONTRACT v1 — compatibility rules (apply to every future change)
+//
+//  1. Never change the number or the type of an existing field.
+//  2. Never reuse a field number. Removed fields go into `reserved`.
+//  3. New fields get NEW numbers; old clients simply ignore them,
+//     old servers see them as default values (backward + forward compatible).
+//  4. A breaking change => new package `reliablemessaging.v2`,
+//     served in parallel with v1 until all clients migrate.
+//
+// ERROR CONTRACT (gRPC status codes returned by the broker)
+//  INVALID_ARGUMENT     request failed validation (never retry unchanged)
+//  NOT_FOUND            unknown publisher / subscriber / delivery
+//  FAILED_PRECONDITION  idempotency_key reused with a different payload
+//  ABORTED              subscribe stream replaced by a newer one (same id)
+//  DEADLINE_EXCEEDED /
+//  UNAVAILABLE /
+//  CANCELLED            OUTCOME UNKNOWN: the operation may or may not have
+//                       been executed -> retry with the SAME idempotency_key
+//  INTERNAL             unexpected broker error (broker keeps running)
+// =====================================================================
+
+service BrokerService {
+  // Health / version probe. Clients use it for fallback decisions.
+  rpc GetServerInfo (GetServerInfoRequest) returns (ServerInfo);
+
+  // Idempotent: registering twice is not an error.
+  rpc RegisterPublisher (RegisterPublisherRequest) returns (RegisterPublisherReply);
+
+  // Idempotent by (publisher_name, idempotency_key).
+  rpc Publish (PublishRequest) returns (PublishReply);
+
+  // Server streaming: the broker pushes deliveries over an open stream.
+  rpc Subscribe (SubscribeRequest) returns (stream SubscriberEvent);
+
+  // Idempotent: acknowledging twice returns already_acknowledged = true.
+  rpc Ack (AckRequest) returns (AckReply);
+
+  rpc Nack (NackRequest) returns (NackReply);
+
+  rpc Unsubscribe (UnsubscribeRequest) returns (UnsubscribeReply);
+
+  rpc GetDeadLetters (GetDeadLettersRequest) returns (GetDeadLettersReply);
+}
+
+// ---------------- server info ----------------
+
+message GetServerInfoRequest {}
+
+message ServerInfo {
+  string api_version = 1;
+  repeated string supported_versions = 2;
+  int32 ack_timeout_seconds = 3;
+  int32 max_retries = 4;
+  google.protobuf.Timestamp server_time = 5;
+}
+
+// ---------------- publisher ----------------
+
+message RegisterPublisherRequest {
+  string publisher_name = 1;
+}
+
+message RegisterPublisherReply {
+  string publisher_name = 1;
+  bool already_registered = 2;
+  int64 stored_messages = 3;
+}
+
+message PublishRequest {
+  // Logical channel (subject). Letters, digits, '_' and '-', max 64.
+  string publisher_name = 1;
+
+  // Generated ONCE per logical message by the client and REUSED on every
+  // retry of that message. Lets the broker detect "same operation again".
+  string idempotency_key = 2;
+
+  // Message body, 1..4096 characters.
+  string content = 3;
+}
+
+message PublishReply {
+  string message_id = 1;
+  int64 offset = 2;                  // position in the publisher's history (1, 2, 3...)
+  bool duplicate = 3;                // true => already stored earlier; this is the ORIGINAL result
+  int32 queued_for_subscribers = 4;  // subscribers it was queued for at first execution
+  google.protobuf.Timestamp accepted_at = 5;
+}
+
+// ---------------- subscriber ----------------
+
+message SubscribeRequest {
+  // Generated once per subscriber process; reuse it when reconnecting
+  // so the broker resumes the same session (pending messages, DLQ, sequence).
+  string subscriber_id = 1;
+  string publisher_name = 2;
+
+  // Default false => the full history is replayed on a NEW subscription
+  // (same behaviour as Part 1). Not replayed again when resuming.
+  bool skip_history = 3;
+}
+
+message SubscriberEvent {
+  oneof event {
+    SubscriptionStarted started = 1;   // always the first event of a stream
+    Delivery delivery = 2;
+    DeliveryAbandoned abandoned = 3;   // a delivery was moved to the DLQ
+  }
+}
+
+message SubscriptionStarted {
+  string subscriber_id = 1;
+  string publisher_name = 2;
+  bool resumed = 3;                    // true => reconnect to an existing session
+  int32 replayed_messages = 4;
+  int32 redelivered_messages = 5;      // un-ACKed messages sent again
+  int32 ack_timeout_seconds = 6;
+  int32 max_attempts = 7;
+}
+
+message Delivery {
+  string delivery_id = 1;      // ACK/NACK key; identical on every redelivery => dedup key
+  string message_id = 2;       // id of the stored message
+  int64 sequence_number = 3;   // per subscriber, consecutive (1, 2, 3...) => ordering
+  string publisher_name = 4;
+  string content = 5;
+  int32 attempt = 6;           // 1 = first delivery, > 1 = redelivery
+  int64 offset = 7;
+  google.protobuf.Timestamp published_at = 8;
+}
+
+message DeliveryAbandoned {
+  string delivery_id = 1;
+  string message_id = 2;
+  int64 sequence_number = 3;   // the subscriber can skip this sequence number
+  string reason = 4;
+}
+
+message AckRequest {
+  string subscriber_id = 1;
+  string delivery_id = 2;
+}
+
+message AckReply {
+  bool already_acknowledged = 1;
+  bool recovered_from_dead_letter = 2;  // late ACK for a message already in the DLQ
+}
+
+message NackRequest {
+  string subscriber_id = 1;
+  string delivery_id = 2;
+  string reason = 3;
+}
+
+message NackReply {
+  bool will_retry = 1;
+  int32 attempts_so_far = 2;
+  int32 max_attempts = 3;
+}
+
+message UnsubscribeRequest {
+  string subscriber_id = 1;
+}
+
+message UnsubscribeReply {
+  bool was_subscribed = 1;
+}
+
+message GetDeadLettersRequest {
+  string subscriber_id = 1;
+}
+
+message GetDeadLettersReply {
+  repeated DeadLetter entries = 1;
+}
+
+message DeadLetter {
+  string delivery_id = 1;
+  string message_id = 2;
+  int64 sequence_number = 3;
+  string publisher_name = 4;
+  string content = 5;
+  int32 attempts = 6;
+  string last_error = 7;
+  google.protobuf.Timestamp dead_lettered_at = 8;
+}
