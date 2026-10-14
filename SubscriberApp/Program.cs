@@ -25,7 +25,7 @@ var client = new BrokerService.BrokerServiceClient(channel);
 var subscriber = new SubscriberClient(
     client,
     subscriberId: "sub-001",
-    publisherId: "pub-001");
+    publisherName: "pub-001");
 
 Console.WriteLine("Subscriber started.");
 Console.WriteLine("Subscriber ID: sub-001");

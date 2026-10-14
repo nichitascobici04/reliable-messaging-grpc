@@ -1,54 +1,66 @@
-﻿using Grpc.Net.Client;
-using PublisherApp;
-using PublisherApp.Outbox;
-using System.Diagnostics.Contracts;
+﻿using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using ReliableMessaging.Contracts.V1;
 
-using var cts = new CancellationTokenSource();
+namespace SubscriberApp.Ordering;
 
-Console.CancelKeyPress += (_, e) =>
+// Simple in-memory ordering buffer for deliveries per publisher.
+// Holds out-of-order deliveries and yields contiguous ready messages.
+public sealed class MessageOrderTracker
 {
-    e.Cancel = true;
-    cts.Cancel();
-};
+    private readonly ConcurrentDictionary<string, long> _nextExpected =
+        new(StringComparer.Ordinal);
 
-var channel = GrpcChannel.ForAddress(
-    "https://localhost:5001");
+    private readonly ConcurrentDictionary<string, SortedDictionary<long, Delivery>> _buffers =
+        new(StringComparer.Ordinal);
 
-var outbox = new FileOutbox();
+    // Return true if the provided sequence is the expected one.
+    public bool IsExpected(string publisherName, long sequenceNumber)
+    {
+        var expected = _nextExpected.GetOrAdd(publisherName, 1L);
+        return sequenceNumber == expected;
+    }
 
-var client = new Contracts.MessageBroker.MessageBrokerClient(channel);
+    // Buffer an out-of-order delivery.
+    public void Buffer(string publisherName, Delivery delivery)
+    {
+        var buf = _buffers.GetOrAdd(publisherName, _ => new SortedDictionary<long, Delivery>());
+        lock (buf)
+        {
+            if (!buf.ContainsKey(delivery.SequenceNumber))
+                buf.Add(delivery.SequenceNumber, delivery);
+        }
+    }
 
-var publisher = new PublisherClient(
-    channel,
-    publisherId: "pub-001",
-    outbox);
+    // Take and return contiguous ready messages starting from the current expected.
+    // Advances the expected counter accordingly.
+    public List<Delivery> TakeReadyMessages(string publisherName)
+    {
+        var ready = new List<Delivery>();
 
-var worker = new OutboxWorker(
-    client,
-    outbox,
-    "pub-001");
+        var expected = _nextExpected.GetOrAdd(publisherName, 1L);
+        if (!_buffers.TryGetValue(publisherName, out var buf))
+            return ready;
 
-_ = worker.RunAsync(cts.Token);
+        lock (buf)
+        {
+            while (buf.TryGetValue(expected, out var del))
+            {
+                buf.Remove(expected);
+                ready.Add(del);
+                expected++;
+            }
+        }
 
-Console.WriteLine("Publisher started.");
-Console.WriteLine("Publisher ID: pub-001");
+        _nextExpected[publisherName] = expected;
+        return ready;
+    }
 
-while (!cts.Token.IsCancellationRequested)
-{
-    Console.Write("Message: ");
-
-    var payload = Console.ReadLine();
-
-    if (string.IsNullOrWhiteSpace(payload))
-        continue;
-
-    var success = await publisher.PublishAsync(
-        topic: "sports",
-        payload,
-        cts.Token);
-
-    Console.WriteLine(
-        success
-            ? "Message accepted by broker."
-            : "Message placed in outbox.");
+    // When a message is processed, caller should advance next expected if it was the exact next.
+    // This helper can be used by higher level logic if needed.
+    public void AdvanceExpected(string publisherName)
+    {
+        _nextExpected.AddOrUpdate(publisherName, 2L, (_, prev) => prev + 1);
+    }
 }

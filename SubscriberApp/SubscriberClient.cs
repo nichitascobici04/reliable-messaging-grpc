@@ -1,5 +1,8 @@
-﻿using ReliableMessaging.Contracts.V1;
+﻿using System;
+using System.Threading;
+using System.Threading.Tasks;
 using Grpc.Core;
+using ReliableMessaging.Contracts.V1;
 using SubscriberApp.Deduplication;
 using SubscriberApp.Ordering;
 
@@ -16,13 +19,13 @@ public sealed class SubscriberClient
     private readonly string _publisherName;
 
     public SubscriberClient(
-        MessageBroker.MessageBrokerClient client,
+        BrokerService.BrokerServiceClient client,
         string subscriberId,
-        string publisherId)
+        string publisherName)
     {
-        _client = client;
-        _subscriberId = subscriberId;
-        _publisherId = publisherId;
+        _client = client ?? throw new ArgumentNullException(nameof(client));
+        _subscriberId = subscriberId ?? throw new ArgumentNullException(nameof(subscriberId));
+        _publisherName = publisherName ?? throw new ArgumentNullException(nameof(publisherName));
 
         _processed = new ProcessedMessageStore();
         _ordering = new MessageOrderTracker();
@@ -43,15 +46,12 @@ public sealed class SubscriberClient
                     StatusCode.Cancelled or
                     StatusCode.DeadlineExceeded)
             {
-                Console.WriteLine(
-                    "Connection lost. Reconnecting...");
+                Console.WriteLine("Connection lost. Reconnecting...");
             }
 
             if (!cancellationToken.IsCancellationRequested)
             {
-                await Task.Delay(
-                    TimeSpan.FromSeconds(2),
-                    cancellationToken);
+                await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken);
             }
         }
     }
@@ -62,7 +62,7 @@ public sealed class SubscriberClient
         var request = new SubscribeRequest
         {
             SubscriberId = _subscriberId,
-            PublisherId = _publisherId
+            PublisherName = _publisherName
         };
 
         using var call = _client.Subscribe(
@@ -84,119 +84,80 @@ public sealed class SubscriberClient
             else if (evt.EventCase == SubscriberEvent.EventOneofCase.Delivery)
             {
                 var delivery = evt.Delivery;
-
-                // procesarea mesajului
+                await HandleMessageAsync(delivery, cancellationToken);
             }
             else if (evt.EventCase == SubscriberEvent.EventOneofCase.Abandoned)
             {
                 var abandoned = evt.Abandoned;
 
-                // mesajul a ajuns în DLQ
+                Console.WriteLine(
+                    $"Delivery abandoned: {abandoned.DeliveryId} seq #{abandoned.SequenceNumber} reason: {abandoned.Reason}");
             }
         }
     }
+
     private async Task HandleMessageAsync(
-    Message message,
-    CancellationToken cancellationToken)
+        Delivery delivery,
+        CancellationToken cancellationToken)
     {
         Console.WriteLine();
         Console.WriteLine(
-            $"[{message.PublisherId}] " +
-            $"Sequence: {message.SequenceNumber}");
+            $"[{delivery.PublisherName}] Sequence: {delivery.SequenceNumber}");
 
-        /*
-         * Duplicate delivery.
-         */
-        if (_processed.HasProcessed(message.DeliveryId))
+        // Duplicate delivery.
+        if (_processed.HasProcessed(delivery.DeliveryId))
         {
-            Console.WriteLine(
-                $"Duplicate {message.DeliveryId}. Sending ACK.");
-
-            await SendAckAsync(
-                message.DeliveryId,
-                cancellationToken);
-
+            Console.WriteLine($"Duplicate {delivery.DeliveryId}. Sending ACK.");
+            await SendAckAsync(delivery.DeliveryId, cancellationToken);
             return;
         }
 
-        /*
-         * Out-of-order message.
-         */
-        if (!_ordering.IsExpected(
-                message.PublisherId,
-                message.SequenceNumber))
+        // Out-of-order message.
+        if (!_ordering.IsExpected(delivery.PublisherName, delivery.SequenceNumber))
         {
-            Console.WriteLine(
-                $"Out-of-order message {message.SequenceNumber}. " +
-                "Buffering.");
-
-            _ordering.Buffer(
-                message.PublisherId,
-                message);
-
+            Console.WriteLine($"Out-of-order message {delivery.SequenceNumber}. Buffering.");
+            _ordering.Buffer(delivery.PublisherName, delivery);
             return;
         }
 
-        await ProcessAndAckAsync(
-            message,
-            cancellationToken);
+        await ProcessAndAckAsync(delivery, cancellationToken);
 
-        /*
-         * Check whether buffered messages can now be processed.
-         */
-        var readyMessages =
-            _ordering.TakeReadyMessages(
-                message.PublisherId);
+        // Check whether buffered messages can now be processed.
+        var readyMessages = _ordering.TakeReadyMessages(delivery.PublisherName);
 
         foreach (var buffered in readyMessages)
         {
-            await ProcessAndAckAsync(
-                buffered,
-                cancellationToken);
+            await ProcessAndAckAsync(buffered, cancellationToken);
         }
     }
 
     private async Task ProcessAndAckAsync(
-        Message message,
+        Delivery delivery,
         CancellationToken cancellationToken)
     {
         try
         {
-            /*
-             * Simulate the local business operation.
-             */
-            Console.WriteLine(
-                $"Processing: {message.Payload}");
-
+            // Simulate the local business operation.
+            Console.WriteLine($"Processing: {delivery.Content}");
             await Task.Delay(100, cancellationToken);
 
-            /*
-             * Mark as processed BEFORE ACK.
-             *
-             * This is important for the critical failure scenario.
-             */
-            _processed.TryMarkProcessed(
-                message.DeliveryId);
+            // Mark as processed BEFORE ACK (important for crash-recovery).
+            _processed.TryMarkProcessed(delivery.DeliveryId);
 
-            await SendAckAsync(
-                message.DeliveryId,
-                cancellationToken);
+            await SendAckAsync(delivery.DeliveryId, cancellationToken);
 
-            Console.WriteLine(
-                $"ACK sent for {message.DeliveryId}.");
+            Console.WriteLine($"ACK sent for {delivery.DeliveryId}.");
         }
         catch
         {
-            await SendNackAsync(
-                message.DeliveryId,
-                cancellationToken);
-
+            await SendNackAsync(delivery.DeliveryId, cancellationToken);
             throw;
         }
     }
+
     private async Task SendAckAsync(
-    string deliveryId,
-    CancellationToken cancellationToken)
+        string deliveryId,
+        CancellationToken cancellationToken)
     {
         var request = new AckRequest
         {
@@ -204,10 +165,11 @@ public sealed class SubscriberClient
             DeliveryId = deliveryId
         };
 
+        // Await the unary response properly.
         await _client.AckAsync(
             request,
             deadline: DateTime.UtcNow.AddSeconds(3),
-            cancellationToken: cancellationToken);
+            cancellationToken: cancellationToken).ResponseAsync;
     }
 
     private async Task SendNackAsync(
@@ -225,7 +187,7 @@ public sealed class SubscriberClient
             await _client.NackAsync(
                 request,
                 deadline: DateTime.UtcNow.AddSeconds(3),
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken).ResponseAsync;
         }
         catch (RpcException)
         {
