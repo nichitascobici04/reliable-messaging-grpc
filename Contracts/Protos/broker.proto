@@ -93,6 +93,7 @@ message PublishReply {
   bool duplicate = 3;                // true => already stored earlier; this is the ORIGINAL result
   int32 queued_for_subscribers = 4;  // subscribers it was queued for at first execution
   google.protobuf.Timestamp accepted_at = 5;
+  bool accepted = 6;
 }
 
 // ---------------- subscriber ----------------

@@ -1,4 +1,6 @@
 <Solution>
   <Project Path="BrokerApp/BrokerApp.csproj" />
   <Project Path="Contracts/Contracts.csproj" />
+  <Project Path="PublisherApp/PublisherApp.csproj" Id="cfc28002-6184-4e3f-8f57-9988a948a3d0" />
+  <Project Path="SubscriberApp/SubscriberApp.csproj" Id="7468c1b4-1af0-4704-8c41-49cedd8a34d3" />
 </Solution>
