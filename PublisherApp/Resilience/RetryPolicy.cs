@@ -1,59 +1,45 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
+using Grpc.Core;
+
 namespace PublisherApp.Resilience;
 
+// Retry with exponential backoff + jitter.
+// The SAME operation (same idempotency key) is repeated, so a retry
+// after a lost response cannot create a second message on the broker.
 public static class RetryPolicy
 {
-    private static readonly Random Random = new();
-
     public static async Task<T> ExecuteAsync<T>(
         Func<CancellationToken, Task<T>> operation,
         int maxAttempts,
         TimeSpan initialDelay,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<int, RpcException, TimeSpan>? onRetry = null)
     {
-        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        for (int attempt = 1; ; attempt++)
         {
             try
             {
                 return await operation(cancellationToken);
             }
-            catch (Exception ex) when (IsTransient(ex))
+            catch (RpcException ex) when (IsTransient(ex) && attempt < maxAttempts)
             {
-                if (attempt == maxAttempts)
-                    throw;
+                double exponentialMs =
+                    initialDelay.TotalMilliseconds * Math.Pow(2, attempt - 1);
 
-                var exponentialDelay =
-                    initialDelay.TotalMilliseconds *
-                    Math.Pow(2, attempt - 1);
+                double jitterMs =
+                    Random.Shared.NextDouble() * exponentialMs * 0.25;
 
-                var jitter =
-                    Random.Shared.NextDouble() *
-                    exponentialDelay * 0.25;
+                TimeSpan delay = TimeSpan.FromMilliseconds(exponentialMs + jitterMs);
 
-                var delay = TimeSpan.FromMilliseconds(
-                    exponentialDelay + jitter);
+                onRetry?.Invoke(attempt, ex, delay);
 
                 await Task.Delay(delay, cancellationToken);
             }
         }
-
-        throw new InvalidOperationException(
-            "Retry policy exited unexpectedly.");
     }
 
-    private static bool IsTransient(Exception exception)
-    {
-        if (exception is Grpc.Core.RpcException rpc)
-        {
-            return rpc.StatusCode is
-                Grpc.Core.StatusCode.Unavailable or
-                Grpc.Core.StatusCode.DeadlineExceeded;
-        }
-
-        return false;
-    }
+    // DEADLINE_EXCEEDED / UNAVAILABLE => outcome UNKNOWN:
+    // the broker may or may not have executed the call, so it is retried.
+    // Everything else (INVALID_ARGUMENT, FAILED_PRECONDITION, ...) is final.
+    public static bool IsTransient(RpcException ex) =>
+        ex.StatusCode is StatusCode.Unavailable or StatusCode.DeadlineExceeded;
 }

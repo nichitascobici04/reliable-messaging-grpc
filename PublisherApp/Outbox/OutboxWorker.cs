@@ -1,57 +1,77 @@
-﻿using System;
-using System.Threading;
-using System.Threading.Tasks;
-using ReliableMessaging.Contracts.V1;
 using Grpc.Core;
+using PublisherApp.Resilience;
 
 namespace PublisherApp.Outbox;
 
+// Fallback path: messages whose outcome is unknown (broker down, response lost)
+// stay in the local outbox file and are resent here, with their ORIGINAL
+// idempotency key, as soon as the broker answers GetServerInfo again.
 public sealed class OutboxWorker
 {
-    private readonly BrokerService.BrokerServiceClient _client;
+    private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(5);
+
+    // Messages younger than this are still being handled by the
+    // foreground retry loop, so the worker leaves them alone.
+    private static readonly TimeSpan MinimumAge = TimeSpan.FromSeconds(15);
+
+    private readonly PublisherClient _publisher;
     private readonly FileOutbox _outbox;
-    private readonly string _publisherId;
+    private readonly string _publisherName;
+
+    private bool _brokerReachable = true;
 
     public OutboxWorker(
-        BrokerService.BrokerServiceClient client,
+        PublisherClient publisher,
         FileOutbox outbox,
-        string publisherId)
+        string publisherName)
     {
-        _client = client;
+        _publisher = publisher;
         _outbox = outbox;
-        _publisherId = publisherId;
+        _publisherName = publisherName;
     }
 
-    public async Task RunAsync(
-        CancellationToken cancellationToken)
+    public async Task RunAsync(CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
         {
             try
             {
-                // Ensure server is reachable (await ResponseAsync)
-                await _client.GetServerInfoAsync(
-                    new GetServerInfoRequest(),
-                    deadline: DateTime.UtcNow.AddSeconds(5),
-                    cancellationToken: cancellationToken).ResponseAsync;
+                await _publisher.GetServerInfoAsync(cancellationToken);
 
-                await FlushOutboxAsync(cancellationToken);
+                if (!_brokerReachable)
+                {
+                    _brokerReachable = true;
+                    Console.WriteLine("\n[Outbox] Broker is reachable again.");
+
+                    // A restarted broker has lost its in-memory state:
+                    // register again so subscribers can find this publisher.
+                    await _publisher.RegisterPublisherAsync(_publisherName, cancellationToken);
+                }
+
+                await FlushAsync(cancellationToken);
             }
-            catch (RpcException)
+            catch (RpcException ex) when (RetryPolicy.IsTransient(ex))
             {
-                // Broker still unavailable.
+                if (_brokerReachable)
+                {
+                    _brokerReachable = false;
+                    Console.WriteLine(
+                        $"\n[Outbox] Broker unavailable ({ex.StatusCode}). " +
+                        "New messages are kept in the outbox.");
+                }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                // cancellation requested -> exit loop
                 break;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"\n[Outbox] Unexpected error: {ex.Message}");
             }
 
             try
             {
-                await Task.Delay(
-                    TimeSpan.FromSeconds(5),
-                    cancellationToken);
+                await Task.Delay(PollInterval, cancellationToken);
             }
             catch (OperationCanceledException)
             {
@@ -60,46 +80,40 @@ public sealed class OutboxWorker
         }
     }
 
-    private async Task FlushOutboxAsync(
-        CancellationToken cancellationToken)
+    private async Task FlushAsync(CancellationToken cancellationToken)
     {
-        var messages =
-            await _outbox.GetAllAsync(cancellationToken);
+        List<OutboxMessage> messages = await _outbox.GetAllAsync(cancellationToken);
 
-        foreach (var message in messages)
+        foreach (OutboxMessage message in messages
+            .Where(m => DateTime.UtcNow - m.CreatedAtUtc >= MinimumAge)
+            .OrderBy(m => m.CreatedAtUtc))
         {
-            var request = new PublishRequest
-            {
-                PublisherName = message.PublisherName,
-                IdempotencyKey = message.IdempotencyKey,
-                Content = message.Content
-            };
-
             try
             {
-                // Call RPC and await the response
-                var response = await _client.PublishAsync(
-                    request,
-                    deadline: DateTime.UtcNow.AddSeconds(5)).ResponseAsync;
+                var reply = await _publisher.PublishOnceAsync(message, cancellationToken);
 
-                // If we received a reply, treat it as delivered (broker accepted)
-                await _outbox.RemoveAsync(
-                    message.IdempotencyKey,
-                    cancellationToken);
+                await _outbox.RemoveAsync(message.IdempotencyKey, cancellationToken);
 
                 Console.WriteLine(
-                    $"Outbox message {message.IdempotencyKey} delivered.");
+                    $"\n[Outbox] \"{message.Content}\" delivered -> message {reply.MessageId}, " +
+                    $"offset {reply.Offset}" +
+                    (reply.Duplicate
+                        ? " (duplicate: the broker had ALREADY stored it, nothing was stored twice)"
+                        : ""));
+            }
+            catch (RpcException ex) when (RetryPolicy.IsTransient(ex))
+            {
+                // Still unknown: keep it and stop for this round to preserve order.
+                return;
             }
             catch (RpcException ex)
-                when (ex.StatusCode is
-                    StatusCode.Unavailable or
-                    StatusCode.DeadlineExceeded)
             {
-                // Keep it in outbox.
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                return;
+                // Final rejection (invalid content, key misuse): retrying cannot help.
+                await _outbox.RemoveAsync(message.IdempotencyKey, cancellationToken);
+
+                Console.WriteLine(
+                    $"\n[Outbox] \"{message.Content}\" rejected by broker: " +
+                    $"{ex.StatusCode} - {ex.Status.Detail}. Removed from outbox.");
             }
         }
     }

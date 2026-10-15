@@ -1,8 +1,0 @@
-[
-  {
-    "PublisherName": "pub-001",
-    "IdempotencyKey": "6aa04a79ed844a478c3027c8d1d39181",
-    "Content": "hello",
-    "CreatedAtUtc": "2026-10-14T21:02:12.5936694Z"
-  }
-]
