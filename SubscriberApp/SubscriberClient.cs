@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using Grpc.Core;
@@ -8,145 +9,200 @@ using SubscriberApp.Ordering;
 
 namespace SubscriberApp;
 
-public sealed class SubscriberClient
+public sealed class SubscriberClient : IAsyncDisposable
 {
     private readonly BrokerService.BrokerServiceClient _client;
-
-    private readonly ProcessedMessageStore _processed;
-    private readonly MessageOrderTracker _ordering;
-
     private readonly string _subscriberId;
-    private readonly string _publisherName;
+
+    private readonly ProcessedMessageStore _processed = new();
+    private readonly MessageOrderTracker _ordering = new();
+
+    // Stream management
+    private CancellationTokenSource? _streamCts;
+    private Task? _listenTask;
+    private string? _subscribedPublisherId;
 
     public SubscriberClient(
         BrokerService.BrokerServiceClient client,
-        string subscriberId,
-        string publisherName)
+        string subscriberId)
     {
         _client = client ?? throw new ArgumentNullException(nameof(client));
         _subscriberId = subscriberId ?? throw new ArgumentNullException(nameof(subscriberId));
-        _publisherName = publisherName ?? throw new ArgumentNullException(nameof(publisherName));
-
-        _processed = new ProcessedMessageStore();
-        _ordering = new MessageOrderTracker();
     }
 
-    public async Task RunAsync(
-        CancellationToken cancellationToken)
+    // Start a subscription to publisherId. If already subscribed, it will be replaced.
+    public Task SubscribeAsync(string publisherId, CancellationToken appCancellationToken = default)
     {
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            try
-            {
-                await ConsumeStreamAsync(cancellationToken);
-            }
-            catch (RpcException ex)
-                when (ex.StatusCode is
-                    StatusCode.Unavailable or
-                    StatusCode.Cancelled or
-                    StatusCode.DeadlineExceeded)
-            {
-                Console.WriteLine("Connection lost. Reconnecting...");
-            }
+        if (string.IsNullOrWhiteSpace(publisherId))
+            throw new ArgumentException("publisherId required", nameof(publisherId));
 
-            if (!cancellationToken.IsCancellationRequested)
-            {
-                await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken);
-            }
-        }
-    }
+        CancelActiveStream();
 
-    private async Task ConsumeStreamAsync(
-        CancellationToken cancellationToken)
-    {
+        _streamCts = CancellationTokenSource.CreateLinkedTokenSource(appCancellationToken);
+        var token = _streamCts.Token;
+
+        _subscribedPublisherId = publisherId;
+
         var request = new SubscribeRequest
         {
             SubscriberId = _subscriberId,
-            PublisherName = _publisherName
+            // The proto uses PublisherName; populate it with the provided publisherId value.
+            PublisherName = publisherId,
+            SkipHistory = false
         };
 
-        using var call = _client.Subscribe(
-            request,
-            deadline: DateTime.UtcNow.AddMinutes(5),
-            cancellationToken: cancellationToken);
-
-        await foreach (var evt in call.ResponseStream.ReadAllAsync(cancellationToken))
+        _listenTask = Task.Run(async () =>
         {
-            if (evt.EventCase == SubscriberEvent.EventOneofCase.Started)
-            {
-                var started = evt.Started;
+            using var call = _client.Subscribe(request, cancellationToken: token);
 
-                Console.WriteLine(
-                    $"Subscribed. Resumed={started.Resumed}, " +
-                    $"Replayed={started.ReplayedMessages}, " +
-                    $"Redelivered={started.RedeliveredMessages}");
-            }
-            else if (evt.EventCase == SubscriberEvent.EventOneofCase.Delivery)
+            try
             {
-                var delivery = evt.Delivery;
-                await HandleMessageAsync(delivery, cancellationToken);
-            }
-            else if (evt.EventCase == SubscriberEvent.EventOneofCase.Abandoned)
-            {
-                var abandoned = evt.Abandoned;
+                await foreach (var ev in call.ResponseStream.ReadAllAsync(token))
+                {
+                    switch (ev.EventCase)
+                    {
+                        case SubscriberEvent.EventOneofCase.Started:
+                        {
+                            var started = ev.Started;
+                            Console.WriteLine(
+                                $"[Started] Resumed={started.Resumed}, Replayed={started.ReplayedMessages}, Redelivered={started.RedeliveredMessages}");
+                            break;
+                        }
 
-                Console.WriteLine(
-                    $"Delivery abandoned: {abandoned.DeliveryId} seq #{abandoned.SequenceNumber} reason: {abandoned.Reason}");
+                        case SubscriberEvent.EventOneofCase.Delivery:
+                        {
+                            var delivery = ev.Delivery;
+                            try
+                            {
+                                await HandleDeliveryAsync(delivery, token);
+                            }
+                            catch (OperationCanceledException) when (token.IsCancellationRequested)
+                            {
+                                return;
+                            }
+                            break;
+                        }
+
+                        case SubscriberEvent.EventOneofCase.Abandoned:
+                        {
+                            var abandoned = ev.Abandoned;
+                            Console.WriteLine(
+                                $"[DLQ] Delivery {abandoned.DeliveryId} seq #{abandoned.SequenceNumber} reason: {abandoned.Reason}");
+                            break;
+                        }
+
+                        case SubscriberEvent.EventOneofCase.None:
+                        default:
+                            break;
+                    }
+                }
+            }
+            catch (RpcException ex) when (ex.StatusCode == StatusCode.Aborted)
+            {
+                Console.WriteLine("[Info] Stream replaced by newer Subscribe call.");
+            }
+            catch (RpcException ex) when (ex.StatusCode == StatusCode.NotFound)
+            {
+                Console.WriteLine($"[Warning] Publisher with id '{publisherId}' not found: {ex.Status.Detail ?? ex.Message}");
+            }
+            catch (RpcException ex)
+            {
+                Console.WriteLine($"[Error] Subscribe stream ended: {ex.StatusCode} - {ex.Status.Detail ?? ex.Message}");
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                // expected
+            }
+        }, CancellationToken.None);
+
+        return Task.CompletedTask;
+    }
+
+    // Ask broker to unsubscribe and cancel local stream.
+    public async Task UnsubscribeAsync()
+    {
+        CancelActiveStream();
+
+        try
+        {
+            var req = new UnsubscribeRequest { SubscriberId = _subscriberId };
+            var reply = await _client.UnsubscribeAsync(req).ResponseAsync;
+            Console.WriteLine($"[Unsubscribe] WasSubscribed={reply.WasSubscribed}");
+            _subscribedPublisherId = null;
+        }
+        catch (RpcException ex)
+        {
+            Console.WriteLine($"[Error] Unsubscribe RPC failed: {ex.StatusCode} - {ex.Status.Detail ?? ex.Message}");
+        }
+    }
+
+    public string? CurrentlySubscribedTo => _subscribedPublisherId;
+
+    public async ValueTask DisposeAsync()
+    {
+        CancelActiveStream();
+        if (_listenTask is not null)
+        {
+            try { await _listenTask; } catch { /* ignore */ }
+        }
+    }
+
+    private void CancelActiveStream()
+    {
+        if (_streamCts is not null)
+        {
+            try
+            {
+                if (!_streamCts.IsCancellationRequested)
+                    _streamCts.Cancel();
+            }
+            catch { /* ignore */ }
+            finally
+            {
+                _streamCts.Dispose();
+                _streamCts = null;
             }
         }
     }
 
-    private async Task HandleMessageAsync(
-        Delivery delivery,
-        CancellationToken cancellationToken)
+    private async Task HandleDeliveryAsync(Delivery delivery, CancellationToken cancellationToken)
     {
         Console.WriteLine();
-        Console.WriteLine(
-            $"[{delivery.PublisherName}] Sequence: {delivery.SequenceNumber}");
+        Console.WriteLine($"[Delivery] Publisher={delivery.PublisherName} Seq={delivery.SequenceNumber} Id={delivery.DeliveryId}");
 
-        // Duplicate delivery.
         if (_processed.HasProcessed(delivery.DeliveryId))
         {
-            Console.WriteLine($"Duplicate {delivery.DeliveryId}. Sending ACK.");
+            Console.WriteLine($"[Duplicate] {delivery.DeliveryId} -> ACK");
             await SendAckAsync(delivery.DeliveryId, cancellationToken);
             return;
         }
 
-        // Out-of-order message.
         if (!_ordering.IsExpected(delivery.PublisherName, delivery.SequenceNumber))
         {
-            Console.WriteLine($"Out-of-order message {delivery.SequenceNumber}. Buffering.");
+            Console.WriteLine($"[OutOfOrder] Seq={delivery.SequenceNumber} Buffering");
             _ordering.Buffer(delivery.PublisherName, delivery);
             return;
         }
 
         await ProcessAndAckAsync(delivery, cancellationToken);
 
-        // Check whether buffered messages can now be processed.
-        var readyMessages = _ordering.TakeReadyMessages(delivery.PublisherName);
-
-        foreach (var buffered in readyMessages)
-        {
-            await ProcessAndAckAsync(buffered, cancellationToken);
-        }
+        var ready = _ordering.TakeReadyMessages(delivery.PublisherName);
+        foreach (var d in ready)
+            await ProcessAndAckAsync(d, cancellationToken);
     }
 
-    private async Task ProcessAndAckAsync(
-        Delivery delivery,
-        CancellationToken cancellationToken)
+    private async Task ProcessAndAckAsync(Delivery delivery, CancellationToken cancellationToken)
     {
         try
         {
-            // Simulate the local business operation.
-            Console.WriteLine($"Processing: {delivery.Content}");
+            Console.WriteLine($"[Process] {delivery.Content}");
             await Task.Delay(100, cancellationToken);
 
-            // Mark as processed BEFORE ACK (important for crash-recovery).
             _processed.TryMarkProcessed(delivery.DeliveryId);
 
             await SendAckAsync(delivery.DeliveryId, cancellationToken);
 
-            Console.WriteLine($"ACK sent for {delivery.DeliveryId}.");
+            Console.WriteLine($"[ACK] {delivery.DeliveryId}");
         }
         catch
         {
@@ -155,43 +211,30 @@ public sealed class SubscriberClient
         }
     }
 
-    private async Task SendAckAsync(
-        string deliveryId,
-        CancellationToken cancellationToken)
+    private async Task SendAckAsync(string deliveryId, CancellationToken cancellationToken)
     {
-        var request = new AckRequest
-        {
-            SubscriberId = _subscriberId,
-            DeliveryId = deliveryId
-        };
-
-        // Await the unary response properly.
-        await _client.AckAsync(
-            request,
-            deadline: DateTime.UtcNow.AddSeconds(3),
-            cancellationToken: cancellationToken).ResponseAsync;
-    }
-
-    private async Task SendNackAsync(
-        string deliveryId,
-        CancellationToken cancellationToken)
-    {
-        var request = new NackRequest
-        {
-            SubscriberId = _subscriberId,
-            DeliveryId = deliveryId
-        };
-
+        var req = new AckRequest { SubscriberId = _subscriberId, DeliveryId = deliveryId };
         try
         {
-            await _client.NackAsync(
-                request,
-                deadline: DateTime.UtcNow.AddSeconds(3),
-                cancellationToken: cancellationToken).ResponseAsync;
+            await _client.AckAsync(req, deadline: DateTime.UtcNow.AddSeconds(5), cancellationToken: cancellationToken).ResponseAsync;
+        }
+        catch (RpcException ex)
+        {
+            Console.WriteLine($"[Error] ACK failed: {ex.StatusCode} - {ex.Status.Detail ?? ex.Message}");
+            throw;
+        }
+    }
+
+    private async Task SendNackAsync(string deliveryId, CancellationToken cancellationToken)
+    {
+        var req = new NackRequest { SubscriberId = _subscriberId, DeliveryId = deliveryId, Reason = "Processing failed" };
+        try
+        {
+            await _client.NackAsync(req, deadline: DateTime.UtcNow.AddSeconds(5), cancellationToken: cancellationToken).ResponseAsync;
         }
         catch (RpcException)
         {
-            // Connection may already be gone.
+            // best-effort
         }
     }
 }
