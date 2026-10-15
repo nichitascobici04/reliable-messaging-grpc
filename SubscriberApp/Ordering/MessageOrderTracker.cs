@@ -1,66 +1,107 @@
-﻿using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Linq;
 using ReliableMessaging.Contracts.V1;
 
 namespace SubscriberApp.Ordering;
 
-// Simple in-memory ordering buffer for deliveries per publisher.
-// Holds out-of-order deliveries and yields contiguous ready messages.
+// Delivers messages to the application strictly in sequence_number order.
+//
+// The broker numbers deliveries PER SUBSCRIBER SESSION (1, 2, 3, ...),
+// across all publishers the session has been subscribed to, so a single
+// counter is kept here (not one per publisher).
+//
+// Used only from the stream-reading loop, so it is not shared between threads.
 public sealed class MessageOrderTracker
 {
-    private readonly ConcurrentDictionary<string, long> _nextExpected =
-        new(StringComparer.Ordinal);
+    // Deliveries that arrived early. A null value means "this sequence number
+    // is already settled" (dead-lettered or already processed) and can be skipped.
+    private readonly SortedDictionary<long, Delivery?> _waiting = new();
 
-    private readonly ConcurrentDictionary<string, SortedDictionary<long, Delivery>> _buffers =
-        new(StringComparer.Ordinal);
+    private bool _resyncOnNextDelivery = true;
 
-    // Return true if the provided sequence is the expected one.
-    public bool IsExpected(string publisherName, long sequenceNumber)
+    public long NextExpected { get; private set; } = 1;
+
+    public int BufferedCount => _waiting.Count(kv => kv.Value is not null);
+
+    // A NEW (not resumed) session starts numbering wherever the broker says;
+    // the first delivery after SubscriptionStarted defines the starting point.
+    public void ResyncOnNextDelivery()
     {
-        var expected = _nextExpected.GetOrAdd(publisherName, 1L);
-        return sequenceNumber == expected;
+        _resyncOnNextDelivery = true;
     }
 
-    // Buffer an out-of-order delivery.
-    public void Buffer(string publisherName, Delivery delivery)
+    public void ObserveFirstDelivery(long sequenceNumber)
     {
-        var buf = _buffers.GetOrAdd(publisherName, _ => new SortedDictionary<long, Delivery>());
-        lock (buf)
+        if (!_resyncOnNextDelivery)
         {
-            if (!buf.ContainsKey(delivery.SequenceNumber))
-                buf.Add(delivery.SequenceNumber, delivery);
+            return;
+        }
+
+        _resyncOnNextDelivery = false;
+        _waiting.Clear();
+        NextExpected = sequenceNumber;
+    }
+
+    public SequenceStatus Classify(long sequenceNumber)
+    {
+        if (sequenceNumber < NextExpected)
+        {
+            return SequenceStatus.Old;
+        }
+
+        return sequenceNumber == NextExpected
+            ? SequenceStatus.Expected
+            : SequenceStatus.Ahead;
+    }
+
+    public void Buffer(Delivery delivery)
+    {
+        // Already settled: nothing left to do for this sequence number.
+        if (_waiting.TryGetValue(delivery.SequenceNumber, out Delivery? existing) &&
+            existing is null)
+        {
+            return;
+        }
+
+        // Keep the newest copy (higher attempt number) of the same delivery.
+        _waiting[delivery.SequenceNumber] = delivery;
+    }
+
+    // The sequence number is settled: processed, or abandoned to the DLQ.
+    public void MarkSettled(long sequenceNumber)
+    {
+        if (sequenceNumber == NextExpected)
+        {
+            NextExpected++;
+        }
+        else if (sequenceNumber > NextExpected)
+        {
+            _waiting[sequenceNumber] = null;
         }
     }
 
-    // Take and return contiguous ready messages starting from the current expected.
-    // Advances the expected counter accordingly.
-    public List<Delivery> TakeReadyMessages(string publisherName)
+    // Next buffered delivery that is now in order, or null if there is a gap.
+    // Settled placeholders are skipped automatically.
+    public Delivery? TakeNextReady()
     {
-        var ready = new List<Delivery>();
-
-        var expected = _nextExpected.GetOrAdd(publisherName, 1L);
-        if (!_buffers.TryGetValue(publisherName, out var buf))
-            return ready;
-
-        lock (buf)
+        while (_waiting.TryGetValue(NextExpected, out Delivery? delivery))
         {
-            while (buf.TryGetValue(expected, out var del))
+            _waiting.Remove(NextExpected);
+
+            if (delivery is null)
             {
-                buf.Remove(expected);
-                ready.Add(del);
-                expected++;
+                NextExpected++;
+                continue;
             }
+
+            return delivery;
         }
 
-        _nextExpected[publisherName] = expected;
-        return ready;
+        return null;
     }
+}
 
-    // When a message is processed, caller should advance next expected if it was the exact next.
-    // This helper can be used by higher level logic if needed.
-    public void AdvanceExpected(string publisherName)
-    {
-        _nextExpected.AddOrUpdate(publisherName, 2L, (_, prev) => prev + 1);
-    }
+public enum SequenceStatus
+{
+    Old,
+    Expected,
+    Ahead
 }
