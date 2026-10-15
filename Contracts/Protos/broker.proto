@@ -107,6 +107,14 @@ message SubscribeRequest {
   // Default false => the full history is replayed on a NEW subscription
   // (same behaviour as Part 1). Not replayed again when resuming.
   bool skip_history = 3;
+
+  // Added in v1 without breaking compatibility (new field number, default false):
+  //  false => NEW subscription: every explicit "subscribe" replays the whole
+  //           history of the publisher, even for a subscriber_id seen before.
+  //  true  => RESUME after a dropped connection: only the un-ACKed messages are
+  //           sent again (no history), so nothing is shown twice.
+  // Old clients never send it, so they always get the Part 1 behaviour (replay).
+  bool resume = 4;
 }
 
 message SubscriberEvent {
@@ -192,4 +200,4 @@ message DeadLetter {
   int32 attempts = 6;
   string last_error = 7;
   google.protobuf.Timestamp dead_lettered_at = 8;
-}
+}

@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Threading.Channels;
 using BrokerApp.Configuration;
 using BrokerApp.Storage;
@@ -126,10 +126,15 @@ public sealed class BrokerState
     // SUBSCRIBERS
     // =========================================================
 
+    // resumeRequested = false => explicit "subscribe": a NEW subscription that
+    //                           replays the whole history (as in Part 1).
+    // resumeRequested = true  => automatic reconnect after a dropped stream:
+    //                           only the un-ACKed messages are sent again.
     public AttachResult Attach(
         string subscriberId,
         string publisherName,
-        bool skipHistory)
+        bool skipHistory,
+        bool resumeRequested)
     {
         if (!topics.TryGetValue(publisherName, out TopicState? topic))
         {
@@ -177,7 +182,9 @@ public sealed class BrokerState
         lock (topic.Sync)
             lock (session.Sync)
             {
-                resumed = session.PublisherName == publisherName;
+                // A resume is only possible for the same publisher, and only
+                // when the client asks for it (reconnect after a lost stream).
+                resumed = resumeRequested && session.PublisherName == publisherName;
 
                 // Only one active stream per subscriber_id.
                 replacedStream = session.StreamCts;
@@ -190,22 +197,45 @@ public sealed class BrokerState
 
                 topic.SubscriberIds.Add(subscriberId);
 
-                // 1) Everything still un-ACKed goes out again, in order.
-                foreach (PendingDelivery pending in
-                    session.Pending.Values.OrderBy(p => p.SequenceNumber).ToList())
+                if (resumed)
                 {
-                    TrySend(session, pending);
-                    redelivered++;
+                    // RESUME: everything still un-ACKed goes out again, in order.
+                    foreach (PendingDelivery pending in
+                        session.Pending.Values.OrderBy(p => p.SequenceNumber).ToList())
+                    {
+                        TrySend(session, pending);
+                        redelivered++;
+                    }
                 }
-
-                // 2) A NEW subscription receives the full history (as in Part 1).
-                //    Not done on resume, otherwise messages would be duplicated.
-                if (!resumed && !skipHistory)
+                else if (!skipHistory)
                 {
+                    // NEW subscription: the old un-ACKed deliveries are replaced by
+                    // the full history (which already contains those messages),
+                    // so nothing is sent twice. The DLQ is kept for inspection.
+                    session.Pending.Clear();
+
                     foreach (StoredMessage stored in topic.History)
                     {
                         EnqueueNewDelivery(session, stored);
                         replayed++;
+                    }
+                }
+                else
+                {
+                    // New subscription without history: keep only what is still
+                    // pending for this publisher.
+                    foreach (PendingDelivery pending in session.Pending.Values
+                        .Where(p => p.Message.PublisherName != publisherName)
+                        .ToList())
+                    {
+                        session.Pending.Remove(pending.DeliveryId);
+                    }
+
+                    foreach (PendingDelivery pending in
+                        session.Pending.Values.OrderBy(p => p.SequenceNumber).ToList())
+                    {
+                        TrySend(session, pending);
+                        redelivered++;
                     }
                 }
             }
@@ -568,4 +598,4 @@ public sealed class BrokerState
             }
         };
     }
-}
+}

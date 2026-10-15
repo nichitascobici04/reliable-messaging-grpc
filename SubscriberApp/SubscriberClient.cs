@@ -150,7 +150,13 @@ public sealed class SubscriberClient : IAsyncDisposable
                 {
                     SubscriberId = SubscriberId,
                     PublisherName = publisherName,
-                    SkipHistory = false
+                    SkipHistory = false,
+
+                    // First call = the user's "subscribe" command => NEW subscription,
+                    // the broker replays the publisher's whole history.
+                    // Automatic reconnects after a lost stream => RESUME, only the
+                    // un-ACKed messages come again (no duplicates on screen).
+                    Resume = everStarted
                 };
 
                 // No deadline on purpose: a subscription is long-lived.
@@ -321,11 +327,14 @@ public sealed class SubscriberClient : IAsyncDisposable
             return false;
         }
 
+        // The message is still SHOWN (history replay must display every old
+        // message), but its effect is not applied a second time.
         Console.WriteLine();
         Console.WriteLine(
-            $"[Duplicate] [{delivery.PublisherName}] seq #{delivery.SequenceNumber} " +
-            $"(attempt {delivery.Attempt}) was already processed -> effect NOT applied again, " +
-            "re-sending ACK.");
+            $"MESSAGE [{delivery.PublisherName}] seq #{delivery.SequenceNumber}: {delivery.Content}");
+        Console.WriteLine(
+            $"  already processed earlier by {SubscriberId} -> effect NOT applied again " +
+            $"(delivery {delivery.DeliveryId}, attempt {delivery.Attempt})");
 
         await SendAckAsync(delivery, token);
         _ordering.MarkSettled(delivery.SequenceNumber);

@@ -1,4 +1,4 @@
-﻿using BrokerApp.Configuration;
+using BrokerApp.Configuration;
 using BrokerApp.Core;
 using BrokerApp.Faults;
 using BrokerApp.Storage;
@@ -132,7 +132,11 @@ public sealed class BrokerGrpcService : BrokerService.BrokerServiceBase
         RequestValidator.ValidatePublisherName(request.PublisherName);
 
         AttachResult attach =
-            state.Attach(request.SubscriberId, request.PublisherName, request.SkipHistory);
+            state.Attach(
+                request.SubscriberId,
+                request.PublisherName,
+                request.SkipHistory,
+                request.Resume);
 
         logger.LogInformation(
             "Subscriber {Subscriber} {Action} {Publisher}: {Replayed} replayed, {Redelivered} redelivered",
@@ -271,4 +275,4 @@ public sealed class BrokerGrpcService : BrokerService.BrokerServiceBase
 
         return Task.FromResult(reply);
     }
-}
+}
